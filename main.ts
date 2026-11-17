@@ -87,9 +87,29 @@ class ZScore {
 const zscore = new ZScore(WIN_BARS);
 /** How many scale-in adds the current position has taken. */
 let adds = 0;
+/**
+ * The client_id of a buy sent on the previous batch but not yet confirmed by
+ * a fill in this batch, or null. The harness reports every fill or rejection
+ * in the next batch, so a buy is never re-sent while one is in flight, and a
+ * scale-in step whose buy was rejected is not lost: it is retried while the
+ * dip still holds. (On the dev window no order is ever rejected, so this
+ * changes nothing there; it only hardens the race window.)
+ */
+let pendingBuyId: string | null = null;
+let pendingBuyWasAdd = false;
+
+/** Fold this batch's fills into the pending-buy bookkeeping. */
+function confirmPending(batch: { fills: { client_id: string; status: string }[] }): void {
+  if (pendingBuyId === null) return;
+  const fill = batch.fills.find((f) => f.client_id === pendingBuyId);
+  if (fill === undefined) return;
+  if (fill.status === 'rejected' && pendingBuyWasAdd) adds -= 1;
+  pendingBuyId = null;
+}
 
 await runBars({
-  onBatch(state: BarsState, batch: { bars: Bar[] }): OrderInput[] {
+  onBatch(state: BarsState, batch: { bars: Bar[]; fills: { client_id: string; status: string }[] }): OrderInput[] {
+    confirmPending(batch);
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
     if (bar === undefined || state.warmingUp) return [];
     const x = Math.log(Number(bar.c) / 1e5);
@@ -101,20 +121,24 @@ await runBars({
     const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
     if (held === undefined) {
       adds = 0;
-      if (z <= Z_IN) {
+      if (z <= Z_IN && pendingBuyId === null) {
         const amount = (state.cash * BigInt(BUY_FRAC_PERCENT)) / 100n;
         if (amount >= minNotional) {
-          return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+          pendingBuyId = `e${state.seq}`;
+          pendingBuyWasAdd = false;
+          return [{ side: 'buy', symbol: SYMBOL, client_id: pendingBuyId, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
         }
       }
       return [];
     }
 
-    if (adds < SCALE_STEPS.length && z <= SCALE_STEPS[adds] && state.cash >= minNotional) {
+    if (adds < SCALE_STEPS.length && z <= SCALE_STEPS[adds] && state.cash >= minNotional && pendingBuyId === null) {
       const amount = (state.cash * BigInt(BUY_FRAC_PERCENT)) / 100n;
       if (amount >= minNotional) {
         adds += 1;
-        return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+        pendingBuyId = `a${adds}-${state.seq}`;
+        pendingBuyWasAdd = true;
+        return [{ side: 'buy', symbol: SYMBOL, client_id: pendingBuyId, notional_quote_units: amount, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
     }
     if (z >= Z_OUT) {
